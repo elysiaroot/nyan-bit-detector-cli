@@ -9,8 +9,10 @@ Written entirely in safe Rust, with no `unsafe` code or external crates. Audio f
 ## Usage
 
 ```bash
-nyan-bit-detector <file.wav|file.flac> [more files...]
+nyan-bit-detector [--] <file.wav|file.flac> [more files...]
 ```
+
+`--` ends option parsing, so files whose names begin with a dash are handled correctly. The bundled wrappers always pass it.
 
 Output is a JSON array containing one object per file:
 
