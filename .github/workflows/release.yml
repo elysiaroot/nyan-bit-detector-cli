@@ -1,0 +1,149 @@
+# Builds all 5 binaries. Runs on v* tags (creates a release) or manually
+# from the Actions tab (artifacts only, downloadable from the run page).
+#
+# Windows code signing (Azure Trusted Signing) kicks in when these exist:
+#   secrets: AZURE_TENANT_ID, AZURE_CLIENT_ID, AZURE_CLIENT_SECRET
+#   vars:    TS_ENDPOINT, TS_ACCOUNT, TS_PROFILE
+# Without TS_ACCOUNT the signing step is skipped and binaries ship unsigned.
+#
+# Actions are pinned to commit SHAs; bump the SHA and the version comment
+# together when upgrading.
+
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  BIN: nyan-bit-detector
+
+jobs:
+  build-macos:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+      - run: cargo build --release --target aarch64-apple-darwin
+      - run: |
+          mkdir -p out
+          cp "target/aarch64-apple-darwin/release/$BIN" "out/$BIN-macos-arm64"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: macos
+          path: out/*
+          if-no-files-found: error
+
+  build-linux-windows:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+          targets: x86_64-unknown-linux-musl,aarch64-unknown-linux-musl,x86_64-pc-windows-gnu,aarch64-pc-windows-gnullvm
+      - run: pip install cargo-zigbuild==0.23.4 # wheel bundles zig
+      - run: |
+          for t in x86_64-unknown-linux-musl aarch64-unknown-linux-musl \
+                   x86_64-pc-windows-gnu aarch64-pc-windows-gnullvm; do
+            cargo zigbuild --release --target "$t"
+          done
+          mkdir -p out
+          cp "target/x86_64-unknown-linux-musl/release/$BIN"      "out/$BIN-linux-amd64"
+          cp "target/aarch64-unknown-linux-musl/release/$BIN"     "out/$BIN-linux-arm64"
+          cp "target/x86_64-pc-windows-gnu/release/$BIN.exe"      "out/$BIN-windows-amd64.exe"
+          cp "target/aarch64-pc-windows-gnullvm/release/$BIN.exe" "out/$BIN-windows-arm64.exe"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: linux
+          path: out/*-linux-*
+          if-no-files-found: error
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: windows-unsigned
+          path: out/*-windows-*
+          if-no-files-found: error
+
+  finalize-windows:
+    needs: build-linux-windows
+    runs-on: windows-latest
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: windows-unsigned
+          path: signdir
+      - name: Smoke test
+        shell: pwsh
+        run: |
+          python -c "import wave,struct; w=wave.open('t.wav','wb'); w.setnchannels(2); w.setsampwidth(2); w.setframerate(44100); w.writeframes(struct.pack('<2h',0,0)*44100); w.close()"
+          $json = & ".\signdir\$env:BIN-windows-amd64.exe" -- t.wav | ConvertFrom-Json
+          if ($json[0].sample_rate_hz -ne 44100 -or $json[0].channels -ne 2) {
+            throw "unexpected probe output: $($json | ConvertTo-Json -Compress)"
+          }
+      - name: Sign (Azure Trusted Signing)
+        if: ${{ vars.TS_ACCOUNT != '' }}
+        uses: azure/trusted-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82 # v2
+        with:
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+          endpoint: ${{ vars.TS_ENDPOINT }}
+          trusted-signing-account-name: ${{ vars.TS_ACCOUNT }}
+          certificate-profile-name: ${{ vars.TS_PROFILE }}
+          files-folder: ${{ github.workspace }}\signdir
+          files-folder-filter: exe
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+      - name: Verify signature
+        if: ${{ vars.TS_ACCOUNT != '' }}
+        shell: pwsh
+        run: |
+          Get-ChildItem signdir\*.exe | ForEach-Object {
+            $sig = Get-AuthenticodeSignature $_.FullName
+            if ($sig.Status -ne 'Valid') { throw "signature invalid on $($_.Name)" }
+          }
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: windows
+          path: signdir/*
+          if-no-files-found: error
+
+  release:
+    if: github.ref_type == 'tag'
+    needs: [build-macos, finalize-windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write      # create the release
+      id-token: write      # build provenance attestation
+      attestations: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: artifacts
+          pattern: "{macos,linux,windows}"
+          merge-multiple: true
+      - run: |
+          cp THIRD-PARTY-NOTICES.txt artifacts/
+          cd artifacts && sha256sum * > SHA256SUMS
+      - uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
+        with:
+          subject-path: artifacts/${{ env.BIN }}-*
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" artifacts/* \
+            --title "$GITHUB_REF_NAME" --generate-notes

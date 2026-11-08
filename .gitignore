@@ -1,0 +1,26 @@
+# build output
+/target/
+/dist/
+*.rs.bk
+
+# skill eval workspace
+/.claude
+
+# node
+node_modules/
+npm-debug.log*
+
+# php
+vendor/
+composer.lock
+
+# editors / OS
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+
+# local test audio (add exceptions like !tests/fixtures/*.wav if needed)
+*.wav
+*.flac
